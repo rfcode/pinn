@@ -31,7 +31,6 @@
 #include "iconcache.h"
 #include "termsdialog.h"
 #include "simulate.h"
-#include "dlginstall.h"
 
 #define LOCAL_DBG_ON   0
 #define LOCAL_DBG_FUNC 0
@@ -183,6 +182,7 @@ MainWindow::MainWindow(const QString &drive, const QString &defaultDisplay, KSpl
     _waitforImages = 0;
     _processedImages = 0;
     _numListsToDownload=0;
+    _noRebootAfterInstall = false;
 
 
     QWidget* spacer = new QWidget();
@@ -404,6 +404,7 @@ MainWindow::MainWindow(const QString &drive, const QString &defaultDisplay, KSpl
     QApplication::processEvents();
 
     ug->list->clear();
+    qDebug() << "mount -t ext4 "+settingsPartition+" /settings";
     if (QProcess::execute("mount -t ext4 "+settingsPartition+" /settings") != 0)
     {
         _qpd->hide();
@@ -530,6 +531,8 @@ MainWindow::MainWindow(const QString &drive, const QString &defaultDisplay, KSpl
         _processedImages |= ALLSD;
     _showAll   = cmdline.contains("showall");
     _fixate    = cmdline.contains("fixate");
+
+    _noRebootAfterInstall = cmdline.contains("noreboot");
 
     if (cmdline.contains("select="))
     {
@@ -1015,13 +1018,11 @@ void MainWindow::on_actionWrite_image_to_disk_triggered()
 
     if (_numBootableOS)
     {
-        dlgInstall dlg;
-        if (!_silent)
-        {
-            dlg.setWindowModality(Qt::WindowModal);
-            if (QDialog::Rejected == dlg.exec())
-                return;
-        }
+        if ( !_silent && QMessageBox::warning(this,
+                                    tr("Confirm"),
+                                    tr("Warning: Some OSes are already installed!\nContinuing will DELETE them.\n\nDo you want to continue?"),
+                                    QMessageBox::Yes|QMessageBox::No, QMessageBox::Yes) == QMessageBox::No)
+            return;
     }
 
     _newList.clear();
@@ -1466,10 +1467,41 @@ void MainWindow::onCompleted(int arg)
         //Only close if there are bootable OSes
         if ((_eDownloadMode == MODE_INSTALL)  || (_eDownloadMode == MODE_REINSTALLNEWER))
         {   //Only reboot for install
-            if (_numBootableOS)
+
+            qDebug() << "_numBootableOS " << _numBootableOS;
+            qDebug() << "_noRebootAfterInstall " << _noRebootAfterInstall;
+            if (_numBootableOS )
             {
-                close();
-                QApplication::quit();
+                //
+                // Clear the forcetrigger flag if present
+                //
+                QProcess::execute("mount -o remount,rw /mnt");
+
+                QString cmdlinefilename = "/mnt/recovery.cmdline";
+                if (!QFile::exists(cmdlinefilename))
+                    cmdlinefilename = "/mnt/cmdline.txt";
+
+                //
+                // Remove artifacts from command line
+                //
+                QFile f(cmdlinefilename);
+                if (f.open(f.ReadOnly))
+                {
+                    QByteArray line = f.readAll().trimmed();
+                    line = line.replace("forcetrigger", "").trimmed();
+                    line = line.replace("silentreinstall", "").trimmed();
+                    line = line.replace("silentinstall", "").trimmed();
+                    f.close();
+                    f.open(f.WriteOnly);
+                    f.write(line);
+                    f.close();
+                }
+
+                if (!_noRebootAfterInstall)
+                {
+                    close();
+                    QApplication::quit();
+                }
             }
         }
     }
@@ -2119,6 +2151,11 @@ void MainWindow::pollNetworkStatus()
     }
 }
 
+void MainWindow::OnsslErrors(QNetworkReply * reply, QList<QSslError> list)
+{
+      reply->ignoreSslErrors(list);
+}
+
 void MainWindow::onOnlineStateChanged(bool online)
 {
 
@@ -2138,6 +2175,8 @@ void MainWindow::onOnlineStateChanged(bool online)
             _listno = 0;
             QNetworkConfigurationManager manager;
             _netaccess->setConfiguration(manager.defaultConfiguration());
+
+            connect(_netaccess, SIGNAL(sslErrors(QNetworkReply *, QList<QSslError>)), this, SLOT(OnsslErrors(QNetworkReply *, QList<QSslError>)));
 
             UpdateTime();
             QString cmdline = getFileContents("/proc/cmdline");
@@ -2661,6 +2700,14 @@ void MainWindow::updateNeeded()
     }
 
     ui->actionWrite_image_to_disk->setEnabled(enableWrite);
+    QIcon newIcon;
+    if (_numBootableOS)
+        newIcon.addFile(":/icons/skull_old.png");
+    else
+        newIcon.addFile(":/icons/backups.png");
+    ui->actionWrite_image_to_disk->setIcon(newIcon);
+
+
 
     QPalette p = ui->neededLabel->palette();
     if (p.color(QPalette::WindowText) != colorNeededLabel)
@@ -3690,10 +3737,33 @@ void MainWindow::pollForNewDisks()
                 //Check for silentreinstallnewer option
                 QString cmdline = getFileContents("/proc/cmdline");
                 int nReinstalls=0;
+                bool bReinstall = false;
+                bool bNewer     = false;
+
                 if (cmdline.contains("silentreinstallnewer"))
+                {
+                    qDebug() << "silentreinstallnewer on cmdline";
+                    bReinstall = true;
+                    bNewer = true;
+                }
+
+                if (cmdline.contains("silentreinstall"))
+                {
+                    qDebug() << "silentreinstall on cmdline";
+                    bReinstall = true;
+                    bNewer = false;
+                }
+
+                qDebug() << "bReinstall " << bReinstall;
+                qDebug() << "bNewer " << bNewer;
+
+                if (bReinstall)
                 {   //Restrict the items to those that have newer versions
+
                     QList<QListWidgetItem *> select = ug->selectedInstalledItems();
                     nReinstalls = select.count();
+
+                    qDebug() << "nReinstalls " << nReinstalls;
 
                     foreach (QListWidgetItem * witem, select)
                     {
@@ -3705,14 +3775,16 @@ void MainWindow::pollForNewDisks()
                         {
                             qDebug() << "found";
                             QVariantMap matchEntry = matchItem->data(Qt::UserRole).toMap();
-                            if (selected_os["release_date"].toString() >= matchEntry["release_date"].toString() )
+                            if (bNewer && (selected_os["release_date"].toString() >= matchEntry["release_date"].toString()) )
                             {
                                 witem->setCheckState(Qt::Unchecked);
                                 nReinstalls--;
                                 qDebug() <<"Deselecting " << selected_os["name"].toString();
                             }
                             else
+                            {
                                 qDebug() << " X " << installedName;
+                            }
                         }
                         else
                         {
@@ -3743,10 +3815,13 @@ void MainWindow::pollForNewDisks()
         }
     }
 
+    qDebug() << "_bootdrive: " << _bootdrive;
+
     if (list.count() != _devlistcount)
     {
         foreach (QString devname, list)
         {
+
             QString blocklink = QFile::symLinkTarget(dirname+"/"+devname);
             /* skip virtual things and partitions */
             if (blocklink.contains("/devices/virtual/") || QFile::exists(blocklink+"/partition") )
@@ -3760,20 +3835,39 @@ void MainWindow::pollForNewDisks()
                 return;
             }
 
-            /* does the drive perhaps have a FAT partition with extra images? */
-            if ("/dev/"+devname != _bootdrive && QFile::exists(sysclassblock(devname, 1)))
-            {
-                QString p1 = partdev(devname, 1);
+            qDebug() << "Checking device: " << "/dev/"+devname;
 
-                if (!QFile::exists("/dev/"+p1))
+            /* does the drive perhaps have a FAT partition with extra images? */
+            //if ("/dev/"+devname != _bootdrive && QFile::exists(sysclassblock(devname, 1)))
+            for (int partnum = 1; partnum < 20; partnum++)
+            {
+                //
+                // Skip looking at the PINN boot partition and the settings partition
+                // of the boot device.
+                //
+                if ( (("/dev/"+devname) == _bootdrive) && ((1 == partnum) || (SETTINGS_PARTNR == partnum)) )
                 {
-                    /* /dev node not created yet. Check again on next round */
-                    return;
+                    qDebug() << "Skipping _bootdrive partition " << partnum;
+                    continue;
                 }
 
-                if (_usbimages && !QFile::exists("/tmp/media/"+p1))
+                if (QFile::exists(sysclassblock(devname, partnum)))
                 {
-                    addImagesFromUSB(p1); //eg 'sda1'
+                    qDebug() << "Checking " << sysclassblock(devname, partnum);
+
+                    QString part_devname = partdev(devname, partnum);
+
+                    if (!QFile::exists("/dev/"+part_devname))
+                    {
+                        /* /dev node not created yet. Check again on next round */
+                        return;
+                    }
+
+                    qDebug() << "part_devname " << part_devname;
+                    if (_usbimages && !QFile::exists("/tmp/media/"+part_devname))
+                    {
+                        addImagesFromUSB(part_devname); //eg 'sda1'
+                    }
                 }
             }
 
@@ -3809,7 +3903,8 @@ void MainWindow::pollForNewDisks()
                 }
             }
 
-            if ((ui->targetComboUsb->findData(devname) == -1) && (!devname.startsWith("mmc")))
+            //if ((ui->targetComboUsb->findData(devname) == -1) && (!devname.startsWith("mmc")))
+            if (ui->targetComboUsb->findData(devname) == -1)
             {
                  /* does the partition structure look like it contains OSes, then select it by default? */
                 if (LooksLikeOSDrive(devname))
@@ -3844,7 +3939,8 @@ bool MainWindow::LooksLikeOSDrive(QString devname)
 {
 
     //@@ maybe mount and check for /os folder present?
-    if( devname != "mmcblk0" && !LooksLikePiDrive(devname) )
+    //if( devname != "mmcblk0" && !LooksLikePiDrive(devname) )
+    if( !LooksLikePiDrive(devname) )
     {
         return (QFile::exists("/tmp/media/"+partdev(devname,1)+"/os") );
     }
@@ -3939,13 +4035,9 @@ void MainWindow::addImage(QVariantMap& m, QIcon &icon, bool &bInstalled)
     QString name = m.value("name").toString();
     QString folder  = m.value("folder").toString();
     QString description = m.value("description").toString();
-    QString version = m.value("version").toString();
     bool recommended = m.value("recommended").toBool();
     DBG(name);
     QListWidgetItem *witem = NULL;
-    QString tooltip;
-
-    tooltip="";
 
     //If it is already installed, we don't care that it WAS installed from a backup, so remove date.
     if (bInstalled)
@@ -4002,19 +4094,6 @@ void MainWindow::addImage(QVariantMap& m, QIcon &icon, bool &bInstalled)
                 friendlyname += "\n"+description;
             witem->setText(friendlyname);
 
-            //Set Tooltip
-            if (m.contains("release_date"))
-            {
-                tooltip += m.value("release_date","").toString();
-            }
-            if (m.contains("version"))
-            {
-                if (!tooltip.isEmpty())
-                    tooltip += ", ";
-                tooltip += m.value("version","").toString();
-            }
-            witem->setToolTip(tooltip);
-
             witem->setData(Qt::UserRole, m);
             witem->setData(SecondIconRole, icon);
             ug->list->update();
@@ -4050,19 +4129,6 @@ void MainWindow::addImage(QVariantMap& m, QIcon &icon, bool &bInstalled)
         witem = new QListWidgetItem(friendlyname);
         witem->setCheckState(Qt::Unchecked);
         witem->setData(Qt::UserRole, m);
-
-        //Set Tooltip
-        if (m.contains("release_date"))
-        {
-            tooltip += m.value("release_date","").toString();
-        }
-        if (m.contains("version"))
-        {
-            if (!tooltip.isEmpty())
-                tooltip += ", ";
-            tooltip += m.value("version","").toString();
-        }
-        witem->setToolTip(tooltip);
 
         witem->setData(SecondIconRole, icon);
 
@@ -4156,6 +4222,7 @@ void MainWindow::addImagesFromUSB(const QString &device)
     QDir dir;
     QString mntpath = "/tmp/media/"+device;
 
+
     dir.mkpath(mntpath);
     QProcess::execute("umount /dev/"+device);
     if (QProcess::execute("mount -o ro /dev/"+device+" "+mntpath) != 0)
@@ -4164,6 +4231,9 @@ void MainWindow::addImagesFromUSB(const QString &device)
         return;
     }
 
+    //
+    // Unmount and skip if os directory is not found
+    //
     if (!QFile::exists(mntpath+"/os"))
     {
         QProcess::execute("umount "+mntpath);
@@ -4172,6 +4242,8 @@ void MainWindow::addImagesFromUSB(const QString &device)
     }
 
     QIcon usbIcon(":/icons/hdd_usb_unmount.png");
+
+    qDebug() << "Checking for images in " << mntpath+"/os";
     QMap<QString,QVariantMap> images = listImages(mntpath+"/os");
 
     foreach (QVariant v, images.values())

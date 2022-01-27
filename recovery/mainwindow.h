@@ -92,6 +92,7 @@ protected:
     unsigned _selectImages;
     unsigned _waitforImages;
     unsigned _processedImages;
+    bool _noRebootAfterInstall;
     QStringList _selectOsList;
 
     enum ModeTag _eDownloadMode;
@@ -188,6 +189,8 @@ protected slots:
     void onCloneError(const QString &msg);
     void onCloneCompleted();
     void newImage(QString Imagefile);
+
+    void OnsslErrors(QNetworkReply *, QList<QSslError>);
 
     void downloadIconRedirectCheck();
     void downloadIconComplete();
